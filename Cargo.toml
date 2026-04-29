@@ -1,0 +1,18 @@
+[package]
+name = "crosshair"
+version = "0.1.0"
+edition = "2024"
+description = "Convergence executor daemon — runs strategies declared on bullseye targets toward their desired state"
+license = "Apache-2.0"
+repository = "https://github.com/marcelocantos/crosshair"
+authors = ["Marcelo Cantos"]
+keywords = ["bullseye", "executor", "daemon", "convergence", "scheduling"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+chrono = { version = "0.4.44", features = ["serde"] }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+serde_yaml_ng = "0.10.0"
+tokio = { version = "1.50.0", features = ["full"] }

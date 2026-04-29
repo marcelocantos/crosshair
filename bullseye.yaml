@@ -1,0 +1,31 @@
+schema_version: 3
+targets:
+  T1:
+    name: Crosshair runs a minimal convergence loop end-to-end against a real bullseye target
+    status: identified
+    value: 5.0
+    cost: 3.0
+    showcase: true
+    acceptance:
+    - Crosshair binary loads a bullseye.yaml file and enumerates targets with a `strategy` block
+    - 'On a tick, crosshair determines whether each strategy-bearing target is satisfied (initially: trust bullseye''s status field; later: pluggable check)'
+    - If unsatisfied, crosshair runs the declared command with a per-attempt timeout, captures exit code + stdout/stderr
+    - Per-target attempt state (`last_attempt_at`, `last_success_at`, `consecutive_failures`, `cooldown_until`) is persisted to SQLite
+    - One real-world target (yadm sync) is converged by the daemon end-to-end on this machine, with the launchd-driven script disabled
+    - Daemon runs as a launchd KeepAlive job; restarts are transparent
+    - Status of all strategy-bearing targets is queryable via a `crosshair status` CLI subcommand
+    context: |-
+      Crosshair is the executor side of the bullseye target system. Bullseye owns the YAML schema (target + strategy block, already shipped in bullseye 0.25.0); crosshair owns the runtime that reads strategies and converges targets.
+
+      Mechanical escalation ladder (from the bullseye 🎯T15 design):
+      1. Per-attempt timeout (kills hung-action class)
+      2. Tick-level backoff (consecutive failures stretch next-attempt: 30m → 2h → 6h)
+      3. Circuit break (after N failures, skip attempts for cooldown; surfaces as stalled)
+      4. Human notification (alerter at threshold M, push notification at threshold N)
+      5. Escalation to agent (opt-in per target)
+
+      Picked as v0.1 because it forces the smallest end-to-end loop: parse strategy, check satisfaction, run command, persist state. Everything else (rich notifications, agent escalation, multi-machine, MCP surface) builds on this skeleton. The yadm convergence is the proof point — it's the original use case that motivated the whole executor design (SSH push hung 9.5h on launchd, blocking subsequent runs).
+
+      Cross-repo: this target satisfies bullseye's 🎯T15 (the umbrella) and unblocks bullseye's 🎯T15.1 (yadm proof point in the bullseye-side ledger).
+    origin: bootstrapped from bullseye 🎯T15 design conversation 2026-04-29
+    discovered: 2026-04-29

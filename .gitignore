@@ -1,0 +1,9 @@
+/target
+.DS_Store
+*.swp
+*.orig
+.idea/
+.vscode/
+
+# Claude Code per-project local state (settings, scheduled tasks, worktrees, etc.)
+.claude/
