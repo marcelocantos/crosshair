@@ -5,6 +5,10 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+/// Embedded agent guide. Surfaced via `crosshair --help-agent` so a coding
+/// agent can pull both the CLI reference and the domain guide in one call.
+pub const AGENT_GUIDE: &str = include_str!("../agents-guide.md");
+
 #[derive(Debug, Parser)]
 #[command(
     name = "crosshair",
@@ -12,8 +16,14 @@ use clap::{Args, Parser, Subcommand};
     about = "Convergence executor daemon for bullseye targets"
 )]
 pub struct Cli {
+    /// Print the full agent guide (CLI reference plus embedded
+    /// agents-guide.md) and exit. Useful for coding agents that need
+    /// the project's domain context alongside the CLI surface.
+    #[arg(long, global = false, exclusive = true)]
+    pub help_agent: bool,
+
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -22,6 +32,18 @@ pub enum Command {
     Run(RunArgs),
     /// Show per-target executor state.
     Status(StatusArgs),
+}
+
+impl Cli {
+    /// Render the `--help` text plus the embedded agent guide. Called
+    /// from `main` when `--help-agent` is passed.
+    pub fn help_agent_text() -> String {
+        use clap::CommandFactory;
+        let mut buf = Self::command().render_help().to_string();
+        buf.push('\n');
+        buf.push_str(AGENT_GUIDE);
+        buf
+    }
 }
 
 #[derive(Debug, Args, Clone)]

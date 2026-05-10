@@ -49,6 +49,18 @@ crosshair status -c /path/to/bullseye.yaml
 
 State defaults to `$HOME/.local/state/crosshair/state.db`; override with `--state`.
 
+## Install
+
+```bash
+brew install marcelocantos/tap/crosshair
+```
+
+Or build from source with `cargo install --path .` from a checkout.
+
+## For coding agents
+
+If you use an agentic coding tool, include `agents-guide.md` in the project context, or run `crosshair --help-agent` to print the CLI reference and the agent guide together.
+
 ## Licence
 
 Apache-2.0.
