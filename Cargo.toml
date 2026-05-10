@@ -10,9 +10,18 @@ keywords = ["bullseye", "executor", "daemon", "convergence", "scheduling"]
 categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
+anyhow = "1.0.95"
 chrono = { version = "0.4.44", features = ["serde"] }
+clap = { version = "4.5.20", features = ["derive"] }
+humantime = "2.1.0"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml_ng = "0.10.0"
+thiserror = "2.0.7"
 tokio = { version = "1.50.0", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.14.0"
