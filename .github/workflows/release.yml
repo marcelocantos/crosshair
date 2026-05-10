@@ -1,0 +1,77 @@
+name: release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            asset_os: darwin
+            asset_arch: arm64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            asset_os: linux
+            asset_arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            asset_os: linux
+            asset_arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Test
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        run: cargo test --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          asset="crosshair-${version}-${{ matrix.asset_os }}-${{ matrix.asset_arch }}.tar.gz"
+          tar -C target/${{ matrix.target }}/release -czf "$asset" crosshair
+          shasum -a 256 "$asset" > "$asset.sha256"
+          echo "asset=$asset" >> "$GITHUB_ENV"
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" "$asset" "$asset.sha256" --clobber
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Justintime50/homebrew-releaser@v3
+        with:
+          homebrew_owner: marcelocantos
+          homebrew_tap: homebrew-tap
+          github_token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          formula_folder: Formula
+          version: ${{ github.event.release.tag_name }}
+          install: 'bin.install "crosshair" => "crosshair"'
+          target_darwin_arm64: true
+          target_linux_amd64: true
+          target_linux_arm64: true
+          test: 'system bin/"crosshair", "--version"'
+          skip_checksum: true
+          update_readme_table: true

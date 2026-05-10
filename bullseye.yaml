@@ -2,10 +2,12 @@ schema_version: 3
 targets:
   T1:
     name: Crosshair runs a minimal convergence loop end-to-end against a real bullseye target
-    status: identified
+    status: achieved
     value: 5.0
     cost: 3.0
     showcase: true
+    actual_cost: 3.0
+    demonstration: 'Live on this machine: crosshair v0.1 installed via `cargo install --path .`; com.marcelocantos.crosshair LaunchAgent bootstrapped (KeepAlive=true, RunAtLoad=true) and running as pid 55569 after a kill-restart test confirmed transparent respawn; com.marcelocantos.yadm-auto-sync booted out and its plist renamed to .disabled. ~/.config/crosshair/targets.yaml declares yadm_sync with command /Users/marcelo/.local/sbin/yadm-auto-sync and timeout 2m. Two convergence runs completed end-to-end (one via `--once`, one via the launchd-managed daemon''s first tick), both exit 0, and `crosshair status` shows the persisted last_attempt_at / last_success_at / failure-counter row populated from SQLite at ~/.local/state/crosshair/state.db. Logs at ~/.local/var/log/crosshair.log.'
     acceptance:
     - Crosshair binary loads a bullseye.yaml file and enumerates targets with a `strategy` block
     - 'On a tick, crosshair determines whether each strategy-bearing target is satisfied (initially: trust bullseye''s status field; later: pluggable check)'
@@ -25,14 +27,6 @@ targets:
       5. Escalation to agent (opt-in per target)
 
       Picked as v0.1 because it forces the smallest end-to-end loop: parse strategy, check satisfaction, run command, persist state. Everything else (rich notifications, agent escalation, multi-machine, MCP surface) builds on this skeleton. The yadm convergence is the proof point — it's the original use case that motivated the whole executor design (SSH push hung 9.5h on launchd, blocking subsequent runs).
-
-      Cross-repo: this target satisfies bullseye's 🎯T15 (the umbrella) and unblocks bullseye's 🎯T15.1 (yadm proof point in the bullseye-side ledger).
-    cross_enables:
-    - repo: marcelocantos/bullseye
-      target: T15
-      note: this daemon is the load-bearing piece of bullseye's 🎯T15 umbrella; retiring T1 here lets bullseye 🎯T15 retire on its daemon-side acceptance
-    - repo: marcelocantos/bullseye
-      target: T15.1
-      note: yadm convergence is the chosen proof-point use case for crosshair v0.1 — landing T1 here directly satisfies bullseye 🎯T15.1
     origin: bootstrapped from bullseye 🎯T15 design conversation 2026-04-29
     discovered: 2026-04-29
+    achieved: 2026-05-10
