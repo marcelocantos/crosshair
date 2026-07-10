@@ -108,7 +108,7 @@ async fn converge_one(store: &Store, t: &StrategyTarget, now: DateTime<Utc>) -> 
         );
     }
 
-    store.record_attempt(t, &outcome, cooldown)?;
+    store.record_attempt(t, &outcome, cooldown, &prior)?;
     Ok(())
 }
 
@@ -130,7 +130,10 @@ fn next_cooldown(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::CommonArgs;
     use crate::store::TargetState;
+    use std::io::Write;
+    use tempfile::{NamedTempFile, tempdir};
 
     fn make_outcome(success: bool) -> AttemptOutcome {
         AttemptOutcome {
@@ -169,5 +172,58 @@ mod tests {
                 "failures_before={failures_before} expected={expected:?} got={delta:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_backgrounded_strategy_does_not_block_the_next_target() {
+        let mut config = NamedTempFile::new().unwrap();
+        config
+            .write_all(
+                br#"
+schema_version: 3
+targets:
+  T1:
+    name: backgrounded
+    status: identified
+    strategy:
+      command: "sleep 30 &"
+      trigger: "every:1h"
+      timeout: 250ms
+  T2:
+    name: follows backgrounded work
+    status: identified
+    strategy:
+      command: "echo second-target"
+      trigger: "every:1h"
+"#,
+            )
+            .unwrap();
+        let state_dir = tempdir().unwrap();
+        let args = RunArgs {
+            common: CommonArgs {
+                configs: vec![config.path().to_path_buf()],
+                state: Some(state_dir.path().join("state.db")),
+            },
+            tick: "1s".to_string(),
+            once: true,
+        };
+        let store = Store::open(args.common.state.as_ref().unwrap()).unwrap();
+
+        time::timeout(Duration::from_secs(1), run_one_tick(&args, &store))
+            .await
+            .expect("backgrounded strategy wedged the tick");
+
+        let targets = load_strategy_targets(&args.common.configs).unwrap();
+        let second = targets
+            .iter()
+            .find(|target| target.target_id == "T2")
+            .unwrap();
+        assert!(
+            store
+                .get_or_empty(second)
+                .unwrap()
+                .last_success_at
+                .is_some()
+        );
     }
 }

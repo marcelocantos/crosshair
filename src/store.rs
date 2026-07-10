@@ -7,7 +7,10 @@
 // `sqlite3` shell, ordering-stable, and round-trips through chrono
 // without per-OS unix-epoch drift.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -49,6 +52,9 @@ impl TargetState {
 
 pub struct Store {
     conn: Connection,
+    /// States which could not be persisted because SQLite was temporarily
+    /// unavailable. They preserve backoff for this daemon's later ticks.
+    fallback: Mutex<HashMap<(String, String), TargetState>>,
 }
 
 impl Store {
@@ -59,14 +65,22 @@ impl Store {
         }
         let conn =
             Connection::open(path).with_context(|| format!("open sqlite at {}", path.display()))?;
-        let store = Self { conn };
+        configure_connection(&conn)?;
+        let store = Self {
+            conn,
+            fallback: Mutex::new(HashMap::new()),
+        };
         store.migrate()?;
         Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let store = Self { conn };
+        configure_connection(&conn)?;
+        let store = Self {
+            conn,
+            fallback: Mutex::new(HashMap::new()),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -107,6 +121,15 @@ impl Store {
 
     pub fn get_or_empty(&self, t: &StrategyTarget) -> Result<TargetState> {
         let key = t.yaml_path.display().to_string();
+        if let Some(state) = self
+            .fallback
+            .lock()
+            .expect("fallback state lock poisoned")
+            .get(&(key.clone(), t.target_id.clone()))
+            .cloned()
+        {
+            return Ok(state);
+        }
         match self.get(&key, &t.target_id)? {
             Some(s) => Ok(s),
             None => Ok(TargetState::empty(key, t.target_id.clone())),
@@ -121,23 +144,12 @@ impl Store {
         t: &StrategyTarget,
         outcome: &AttemptOutcome,
         cooldown_until: Option<DateTime<Utc>>,
+        prior: &TargetState,
     ) -> Result<()> {
         let key = t.yaml_path.display().to_string();
-        let prev = self.get(&key, &t.target_id)?;
+        let state = state_after_attempt(t, outcome, cooldown_until, prior);
 
-        let last_success_at = if outcome.succeeded() {
-            Some(outcome.finished_at)
-        } else {
-            prev.as_ref().and_then(|p| p.last_success_at)
-        };
-
-        let consecutive_failures: u32 = if outcome.succeeded() {
-            0
-        } else {
-            prev.as_ref().map(|p| p.consecutive_failures).unwrap_or(0) + 1
-        };
-
-        self.conn.execute(
+        let result = self.conn.execute(
             r#"INSERT INTO target_state (
                     yaml_path, target_id, last_attempt_at, last_success_at,
                     consecutive_failures, cooldown_until,
@@ -154,19 +166,34 @@ impl Store {
                     last_timed_out = excluded.last_timed_out
                 "#,
             params![
-                key,
-                t.target_id,
-                outcome.finished_at.to_rfc3339(),
-                last_success_at.map(|t| t.to_rfc3339()),
-                consecutive_failures,
-                cooldown_until.map(|t| t.to_rfc3339()),
-                outcome.exit_code,
-                truncate(&outcome.stdout, 4096),
-                truncate(&outcome.stderr, 4096),
-                outcome.timed_out as i64,
+                state.yaml_path,
+                state.target_id,
+                state.last_attempt_at.map(|t| t.to_rfc3339()),
+                state.last_success_at.map(|t| t.to_rfc3339()),
+                state.consecutive_failures,
+                state.cooldown_until.map(|t| t.to_rfc3339()),
+                state.last_exit_code,
+                state.last_stdout,
+                state.last_stderr,
+                state.last_timed_out as i64,
             ],
-        )?;
-        Ok(())
+        );
+        match result {
+            Ok(_) => {
+                self.fallback
+                    .lock()
+                    .expect("fallback state lock poisoned")
+                    .remove(&(key, t.target_id.clone()));
+                Ok(())
+            }
+            Err(error) => {
+                self.fallback
+                    .lock()
+                    .expect("fallback state lock poisoned")
+                    .insert((key, t.target_id.clone()), state);
+                Err(error.into())
+            }
+        }
     }
 
     pub fn list(&self) -> Result<Vec<TargetState>> {
@@ -181,6 +208,39 @@ impl Store {
             .query_map([], row_to_state)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+}
+
+fn configure_connection(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    Ok(())
+}
+
+fn state_after_attempt(
+    t: &StrategyTarget,
+    outcome: &AttemptOutcome,
+    cooldown_until: Option<DateTime<Utc>>,
+    prior: &TargetState,
+) -> TargetState {
+    TargetState {
+        yaml_path: t.yaml_path.display().to_string(),
+        target_id: t.target_id.clone(),
+        last_attempt_at: Some(outcome.finished_at),
+        last_success_at: outcome
+            .succeeded()
+            .then_some(outcome.finished_at)
+            .or(prior.last_success_at),
+        consecutive_failures: if outcome.succeeded() {
+            0
+        } else {
+            prior.consecutive_failures + 1
+        },
+        cooldown_until,
+        last_exit_code: outcome.exit_code,
+        last_stdout: Some(truncate(&outcome.stdout, 4096)),
+        last_stderr: Some(truncate(&outcome.stderr, 4096)),
+        last_timed_out: outcome.timed_out,
     }
 }
 
@@ -222,6 +282,7 @@ mod tests {
     use super::*;
     use crate::schema::{Status, Strategy, Target};
     use std::path::PathBuf;
+    use tempfile::NamedTempFile;
 
     fn fake_target() -> StrategyTarget {
         let s = Strategy {
@@ -267,14 +328,18 @@ mod tests {
     fn success_resets_consecutive_failures() {
         let s = Store::open_in_memory().unwrap();
         let t = fake_target();
-        s.record_attempt(&t, &outcome(false, Some(1)), None)
+        let prior = s.get_or_empty(&t).unwrap();
+        s.record_attempt(&t, &outcome(false, Some(1)), None, &prior)
             .unwrap();
-        s.record_attempt(&t, &outcome(false, Some(1)), None)
+        let prior = s.get_or_empty(&t).unwrap();
+        s.record_attempt(&t, &outcome(false, Some(1)), None, &prior)
             .unwrap();
         let after_two = s.get_or_empty(&t).unwrap();
         assert_eq!(after_two.consecutive_failures, 2);
 
-        s.record_attempt(&t, &outcome(true, None), None).unwrap();
+        let prior = s.get_or_empty(&t).unwrap();
+        s.record_attempt(&t, &outcome(true, None), None, &prior)
+            .unwrap();
         let after_ok = s.get_or_empty(&t).unwrap();
         assert_eq!(after_ok.consecutive_failures, 0);
         assert!(after_ok.last_success_at.is_some());
@@ -287,11 +352,56 @@ mod tests {
         a.target_id = "T2".into();
         let mut b = fake_target();
         b.target_id = "T1".into();
-        s.record_attempt(&a, &outcome(true, None), None).unwrap();
-        s.record_attempt(&b, &outcome(true, None), None).unwrap();
+        let prior_a = s.get_or_empty(&a).unwrap();
+        s.record_attempt(&a, &outcome(true, None), None, &prior_a)
+            .unwrap();
+        let prior_b = s.get_or_empty(&b).unwrap();
+        s.record_attempt(&b, &outcome(true, None), None, &prior_b)
+            .unwrap();
         let rows = s.list().unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].target_id, "T1");
         assert_eq!(rows[1].target_id, "T2");
+    }
+
+    #[test]
+    fn file_store_enables_wal_and_busy_timeout() {
+        let db = NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).unwrap();
+        let journal_mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let busy_timeout: i64 = store
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert!(busy_timeout > 0);
+    }
+
+    #[test]
+    fn failed_persist_keeps_a_cooldown_for_the_next_tick() {
+        let db = NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).unwrap();
+        // Make the test deterministic without waiting for the production
+        // five-second busy timeout.
+        store.conn.busy_timeout(Duration::ZERO).unwrap();
+        let blocker = Connection::open(db.path()).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let target = fake_target();
+        let prior = store.get_or_empty(&target).unwrap();
+        let cooldown = Some(Utc::now() + chrono::Duration::minutes(30));
+        assert!(
+            store
+                .record_attempt(&target, &outcome(false, Some(1)), cooldown, &prior)
+                .is_err()
+        );
+
+        let fallback = store.get_or_empty(&target).unwrap();
+        assert_eq!(fallback.consecutive_failures, 1);
+        assert_eq!(fallback.cooldown_until, cooldown);
+        blocker.execute_batch("ROLLBACK").unwrap();
     }
 }

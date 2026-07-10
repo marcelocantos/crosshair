@@ -202,6 +202,7 @@ dependencies = [
  "clap",
  "croner",
  "humantime",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
