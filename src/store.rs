@@ -209,6 +209,12 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_busy_timeout_for_test(&self, timeout: Duration) -> Result<()> {
+        self.conn.busy_timeout(timeout)?;
+        Ok(())
+    }
 }
 
 fn configure_connection(conn: &Connection) -> Result<()> {
