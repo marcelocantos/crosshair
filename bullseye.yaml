@@ -42,7 +42,7 @@ targets:
     achieved: 2026-05-10
   T2:
     name: 'Strategy targets honor their trigger: scheduled triggers (cron/interval) only run when due, not every tick'
-    status: identified
+    status: achieved
     value: 0.0
     cost: 0.0
     acceptance:
@@ -54,9 +54,10 @@ targets:
     context: 'The `trigger` field already exists in the schema (src/schema.rs Strategy.trigger) and parses values like \"cron:0 * * * *\", but v0.1.0''s tick loop ignores it: converge_one runs every non-terminal strategy target each tick, gated only by failure-backoff cooldown. This makes crosshair unusable for genuinely scheduled (vs. converge-until-satisfied) work. Surfaced 2026-07-04 while trying to migrate ytt''s nightly YouTube ingest onto crosshair (ytt 🎯T7): running ingest every tick would hammer YouTube into IP-blocking. Blocks ytt 🎯T7 (cross-repo).'
     origin: manual
     discovered: 2026-07-04
+    achieved: 2026-07-10
   T3:
     name: crosshair's confirmed Fable-audit defects are remediated (process-group kill, bounded drains, store durability)
-    status: identified
+    status: achieved
     value: 0.0
     cost: 0.0
     acceptance:
@@ -67,3 +68,4 @@ targets:
     - fable-audit
     origin: manual
     discovered: 2026-07-08
+    achieved: 2026-07-10
