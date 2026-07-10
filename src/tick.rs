@@ -4,8 +4,8 @@
 // Drive the convergence loop. Each tick:
 //   1. Reload all configured bullseye.yaml files (so target edits
 //      take effect without restart).
-//   2. For every strategy-bearing target whose status is non-terminal
-//      and whose cooldown has expired, run the strategy.
+//   2. For every strategy-bearing target whose trigger is due and whose
+//      cooldown has expired, run the strategy.
 //   3. Persist the outcome and compute the next cooldown from the
 //      consecutive-failure count.
 //
@@ -83,11 +83,10 @@ async fn run_one_tick(args: &RunArgs, store: &Store) {
 }
 
 async fn converge_one(store: &Store, t: &StrategyTarget, now: DateTime<Utc>) -> Result<()> {
-    if !needs_attempt(t) {
+    let prior = store.get_or_empty(t)?;
+    if !needs_attempt(t, &prior, now)? {
         return Ok(());
     }
-
-    let prior = store.get_or_empty(t)?;
     if let Some(until) = prior.cooldown_until
         && until > now
     {
