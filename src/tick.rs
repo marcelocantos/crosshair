@@ -248,7 +248,7 @@ targets:
     status: identified
     strategy:
       command: "printf x >> {}; exit 1"
-      trigger: manual
+      trigger: "every:1s"
 "#,
             marker.display()
         )
