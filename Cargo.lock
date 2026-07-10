@@ -190,6 +190,7 @@ dependencies = [
  "chrono",
  "clap",
  "humantime",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
