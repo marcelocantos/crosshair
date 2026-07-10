@@ -11,14 +11,18 @@
 // changes to commit).
 
 use std::process::Stdio;
+use std::str::FromStr;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Timelike, Utc};
+use croner::Cron;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::loader::StrategyTarget;
+use crate::store::TargetState;
 
 /// Default per-attempt timeout when the strategy doesn't specify one.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -40,11 +44,55 @@ impl AttemptOutcome {
     }
 }
 
-/// Decide whether a strategy needs to run at all. Initial implementation:
-/// terminal status (achieved or set_aside) means no work; anything else
-/// means run the command and let it decide.
-pub fn needs_attempt(t: &StrategyTarget) -> bool {
-    !t.target.status.is_terminal()
+/// Decide whether a strategy is due for an automatic attempt.
+///
+/// Terminal targets and manual strategies never run. Cron strategies run once
+/// in each matching minute; interval strategies run no more often than their
+/// configured duration, measured from the previous attempt.
+pub fn needs_attempt(t: &StrategyTarget, state: &TargetState, now: DateTime<Utc>) -> Result<bool> {
+    if t.target.status.is_terminal() {
+        return Ok(false);
+    }
+
+    let trigger = t.strategy.trigger.trim();
+    if trigger == "manual" {
+        return Ok(false);
+    }
+
+    if let Some(expression) = trigger.strip_prefix("cron:") {
+        let expression = expression.trim();
+        if expression.split_whitespace().count() != 5 {
+            bail!("cron trigger must contain five fields: {expression:?}");
+        }
+        let schedule = Cron::from_str(expression)
+            .with_context(|| format!("parse cron trigger {expression:?}"))?;
+        let current_minute = now
+            .with_second(0)
+            .and_then(|time| time.with_nanosecond(0))
+            .expect("zero is a valid second and nanosecond");
+        if !schedule
+            .is_time_matching(&current_minute)
+            .with_context(|| format!("evaluate cron trigger {expression:?}"))?
+        {
+            return Ok(false);
+        }
+
+        return Ok(state
+            .last_attempt_at
+            .is_none_or(|previous| previous < current_minute));
+    }
+
+    if let Some(duration) = trigger.strip_prefix("every:") {
+        let duration = humantime::parse_duration(duration.trim())
+            .with_context(|| format!("parse interval trigger {trigger:?}"))?;
+        let interval = chrono::Duration::from_std(duration)
+            .with_context(|| format!("interval trigger is too large: {trigger:?}"))?;
+        return Ok(state
+            .last_attempt_at
+            .is_none_or(|previous| now - previous >= interval));
+    }
+
+    bail!("unsupported strategy trigger {trigger:?}")
 }
 
 /// Resolve the strategy's per-attempt timeout, falling back to default.
@@ -160,6 +208,7 @@ mod tests {
     use super::*;
     use crate::loader::StrategyTarget;
     use crate::schema::{Status, Strategy, Target};
+    use chrono::TimeZone;
     use std::path::PathBuf;
 
     fn make_target(command: &str, timeout: Option<&str>) -> StrategyTarget {
@@ -211,13 +260,41 @@ mod tests {
     #[test]
     fn terminal_status_skips_attempt() {
         let mut t = make_target("true", None);
+        let state = TargetState::empty("/tmp/test.yaml".into(), "T1".into());
         t.target.status = Status::Achieved;
-        assert!(!needs_attempt(&t));
+        assert!(!needs_attempt(&t, &state, Utc::now()).unwrap());
         t.target.status = Status::SetAside;
-        assert!(!needs_attempt(&t));
+        assert!(!needs_attempt(&t, &state, Utc::now()).unwrap());
         t.target.status = Status::Identified;
-        assert!(needs_attempt(&t));
+        assert!(!needs_attempt(&t, &state, Utc::now()).unwrap());
         t.target.status = Status::Converging;
-        assert!(needs_attempt(&t));
+        assert!(!needs_attempt(&t, &state, Utc::now()).unwrap());
+    }
+
+    #[test]
+    fn daily_cron_runs_once_per_day_across_ticks() {
+        let mut t = make_target("true", None);
+        t.strategy.trigger = "cron:0 0 * * *".into();
+        let first_tick = Utc.with_ymd_and_hms(2026, 7, 10, 0, 0, 15).unwrap();
+        let mut state = TargetState::empty("/tmp/test.yaml".into(), "T1".into());
+
+        assert!(needs_attempt(&t, &state, first_tick).unwrap());
+        state.last_attempt_at = Some(first_tick);
+        assert!(!needs_attempt(&t, &state, first_tick + chrono::Duration::seconds(30)).unwrap());
+        assert!(!needs_attempt(&t, &state, first_tick + chrono::Duration::hours(12)).unwrap());
+        assert!(needs_attempt(&t, &state, first_tick + chrono::Duration::days(1)).unwrap());
+    }
+
+    #[test]
+    fn interval_uses_last_attempt_as_its_rate_limit() {
+        let mut t = make_target("true", None);
+        t.strategy.trigger = "every:24h".into();
+        let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+        let mut state = TargetState::empty("/tmp/test.yaml".into(), "T1".into());
+
+        assert!(needs_attempt(&t, &state, now).unwrap());
+        state.last_attempt_at = Some(now);
+        assert!(!needs_attempt(&t, &state, now + chrono::Duration::hours(23)).unwrap());
+        assert!(needs_attempt(&t, &state, now + chrono::Duration::hours(24)).unwrap());
     }
 }
