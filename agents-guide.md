@@ -24,7 +24,7 @@ targets:
     status: identified         # achieved | set_aside skip the runner entirely
     strategy:
       command: /path/to/script # run via `sh -c` (shell idioms work)
-      trigger: cron:*/30 * * * *  # currently advisory; tick loop drives cadence
+      trigger: "cron:*/30 * * * *" # five-field cron expression
       timeout: 2m              # per-attempt ceiling; default 5m
       retry:
         max_attempts: 5        # advisory in v0.1; cooldown ladder is fixed
@@ -32,6 +32,12 @@ targets:
 ```
 
 The `command` is dispatched through `sh -c`, so pipes, env interpolation, and absolute paths all work. The strategy is responsible for being idempotent — when the target's desired state is already in place, the command should exit 0 quickly (a heartbeat, not a full re-run).
+
+Supported triggers are:
+
+- `cron:<five-field expression>` — run once in each matching minute.
+- `every:<duration>` — run at most once per duration, measured from the prior attempt.
+- `manual` — never run automatically; invoke the command outside crosshair when appropriate.
 
 ## CLI
 
@@ -41,7 +47,7 @@ crosshair status  -c <bullseye.yaml>
 ```
 
 - `--config` / `-c` — repeatable; each YAML's strategy-bearing targets are merged.
-- `--tick` — loop interval (default `30s`). The strategy `trigger` is currently informational; cadence comes from `--tick`.
+- `--tick` — loop interval (default `30s`). It determines how often crosshair checks whether each strategy's trigger is due.
 - `--once` — run a single tick and exit. Useful for cron-driven setups and tests.
 - `--state` — SQLite path. Defaults to `$HOME/.local/state/crosshair/state.db`.
 
@@ -52,12 +58,12 @@ crosshair status  -c <bullseye.yaml>
 Each tick:
 
 1. Reload all configured YAML files (so target edits take effect without restart).
-2. Skip terminal-status targets (`achieved`, `set_aside`).
+2. Skip terminal-status targets (`achieved`, `set_aside`) and strategies whose trigger is not due.
 3. Skip targets whose `cooldown_until` is in the future.
 4. For the rest, run `command` under the per-attempt timeout. Capture exit, stdout, stderr.
 5. Update SQLite. On failure, set the next cooldown from the backoff ladder.
 
-Backoff ladder (indexed by *new* consecutive-failure count): 30m → 2h → 6h → 24h. A successful attempt clears `cooldown_until` so the next tick re-evaluates immediately.
+Backoff ladder (indexed by *new* consecutive-failure count): 30m → 2h → 6h → 24h. A successful attempt clears `cooldown_until`; the strategy still waits for its next scheduled cron minute or interval.
 
 ## Running as a launchd KeepAlive job
 
@@ -98,8 +104,8 @@ The SQLite store keys on the *canonical absolute path* of the YAML file plus the
 
 ## Limits in v0.1
 
-- **Satisfaction check is trust-the-status-field.** `achieved` / `set_aside` skip; everything else runs the command and lets it decide. A pluggable check is planned.
-- **`trigger` is advisory.** All targets evaluate every `--tick`; per-target trigger expressions (`cron:`, `fswatch:`, `on_wake:`) parse but don't affect cadence yet.
+- **Satisfaction check is trust-the-status-field.** `achieved` / `set_aside` skip; due non-terminal strategies run their command and let it decide. A pluggable check is planned.
+- **Triggers are deliberately narrow.** Only five-field `cron:`, duration-based `every:`, and `manual` are supported. Unsupported trigger kinds fail the tick rather than silently running at the wrong cadence.
 - **Backoff ladder is hard-coded.** `retry.backoff` is parsed but the schedule is fixed at 30m → 2h → 6h → 24h.
 - **No notifications, no agent escalation, no MCP surface.** Failures show up in `crosshair status` and the launchd log; everything past that is for later releases.
 
@@ -109,3 +115,4 @@ The SQLite store keys on the *canonical absolute path* of the YAML file plus the
 - Absolute paths beat `$PATH` — launchd's default `PATH` is minimal. Either set `EnvironmentVariables.PATH` in the plist, or use absolute paths in the strategy command.
 - The state DB and the launchd log are *not* in the same directory. State: `~/.local/state/crosshair/state.db`. Logs: wherever your plist points `StandardOutPath` (the recommended setup uses `~/.local/var/log/crosshair.log`).
 - `crosshair status` reads the same `--config` files as `run`. If a target was deleted from the YAML, it disappears from `status` even if there's still a state row in SQLite.
+- An attempt owns its own Unix process group. Crosshair kills that group after a timeout and when the shell exits, so commands must not background or daemonize work they expect to survive the attempt.
