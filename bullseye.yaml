@@ -69,3 +69,14 @@ targets:
     origin: manual
     discovered: 2026-07-08
     achieved: 2026-07-10
+  T4:
+    name: Crosshair pull requests run formatting, Clippy, and tests in GitHub Actions
+    status: identified
+    value: 0.0
+    cost: 0.0
+    acceptance:
+    - A pull request runs cargo fmt --check, cargo clippy with warnings denied, and cargo test on GitHub Actions.
+    - The workflow uses the stable Rust toolchain and Swatinem/rust-cache.
+    context: 'Discovered during v0.2.0 release preparation: the repository had only a release-triggered workflow, leaving pull requests without a CI gate.'
+    origin: release audit 2026-07-11
+    discovered: 2026-07-11
