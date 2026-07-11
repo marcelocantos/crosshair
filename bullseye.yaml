@@ -71,7 +71,7 @@ targets:
     achieved: 2026-07-10
   T4:
     name: Crosshair pull requests run formatting, Clippy, and tests in GitHub Actions
-    status: identified
+    status: achieved
     value: 0.0
     cost: 0.0
     acceptance:
@@ -80,3 +80,4 @@ targets:
     context: 'Discovered during v0.2.0 release preparation: the repository had only a release-triggered workflow, leaving pull requests without a CI gate.'
     origin: release audit 2026-07-11
     discovered: 2026-07-11
+    achieved: 2026-07-11
