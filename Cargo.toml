@@ -1,6 +1,6 @@
 [package]
 name = "crosshair"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Convergence executor daemon — runs strategies declared on bullseye targets toward their desired state"
 license = "Apache-2.0"
@@ -13,7 +13,9 @@ categories = ["development-tools", "command-line-utilities"]
 anyhow = "1.0.95"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.5.20", features = ["derive"] }
+croner = "3.0.1"
 humantime = "2.1.0"
+libc = "0.2.186"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

@@ -11,17 +11,28 @@
 // changes to commit).
 
 use std::process::Stdio;
+use std::str::FromStr;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Timelike, Utc};
+use croner::Cron;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::loader::StrategyTarget;
+use crate::store::TargetState;
 
 /// Default per-attempt timeout when the strategy doesn't specify one.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// The largest amount of strategy output retained before storing it.
+const OUTPUT_CAP: usize = 64 * 1024;
+
+/// Output readers must not keep a tick alive if a descendant retains a pipe.
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Result of running a single attempt.
 #[derive(Debug)]
@@ -40,11 +51,55 @@ impl AttemptOutcome {
     }
 }
 
-/// Decide whether a strategy needs to run at all. Initial implementation:
-/// terminal status (achieved or set_aside) means no work; anything else
-/// means run the command and let it decide.
-pub fn needs_attempt(t: &StrategyTarget) -> bool {
-    !t.target.status.is_terminal()
+/// Decide whether a strategy is due for an automatic attempt.
+///
+/// Terminal targets and manual strategies never run. Cron strategies run once
+/// in each matching minute; interval strategies run no more often than their
+/// configured duration, measured from the previous attempt.
+pub fn needs_attempt(t: &StrategyTarget, state: &TargetState, now: DateTime<Utc>) -> Result<bool> {
+    if t.target.status.is_terminal() {
+        return Ok(false);
+    }
+
+    let trigger = t.strategy.trigger.trim();
+    if trigger == "manual" {
+        return Ok(false);
+    }
+
+    if let Some(expression) = trigger.strip_prefix("cron:") {
+        let expression = expression.trim();
+        if expression.split_whitespace().count() != 5 {
+            bail!("cron trigger must contain five fields: {expression:?}");
+        }
+        let schedule = Cron::from_str(expression)
+            .with_context(|| format!("parse cron trigger {expression:?}"))?;
+        let current_minute = now
+            .with_second(0)
+            .and_then(|time| time.with_nanosecond(0))
+            .expect("zero is a valid second and nanosecond");
+        if !schedule
+            .is_time_matching(&current_minute)
+            .with_context(|| format!("evaluate cron trigger {expression:?}"))?
+        {
+            return Ok(false);
+        }
+
+        return Ok(state
+            .last_attempt_at
+            .is_none_or(|previous| previous < current_minute));
+    }
+
+    if let Some(duration) = trigger.strip_prefix("every:") {
+        let duration = humantime::parse_duration(duration.trim())
+            .with_context(|| format!("parse interval trigger {trigger:?}"))?;
+        let interval = chrono::Duration::from_std(duration)
+            .with_context(|| format!("interval trigger is too large: {trigger:?}"))?;
+        return Ok(state
+            .last_attempt_at
+            .is_none_or(|previous| now - previous >= interval));
+    }
+
+    bail!("unsupported strategy trigger {trigger:?}")
 }
 
 /// Resolve the strategy's per-attempt timeout, falling back to default.
@@ -71,6 +126,9 @@ pub async fn run_attempt(t: &StrategyTarget) -> AttemptOutcome {
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
         .kill_on_drop(true);
+    // A strategy and every process it starts must be killed together.
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -85,45 +143,60 @@ pub async fn run_attempt(t: &StrategyTarget) -> AttemptOutcome {
             };
         }
     };
+    let process_group = AttemptProcessGroup::new(child.id().expect("spawned child has a PID"));
 
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
 
-    let stdout_task = tokio::spawn(read_to_string_capped(stdout, 64 * 1024));
-    let stderr_task = tokio::spawn(read_to_string_capped(stderr, 64 * 1024));
+    let mut stdout_task = tokio::spawn(read_to_string_capped(stdout, OUTPUT_CAP));
+    let mut stderr_task = tokio::spawn(read_to_string_capped(stderr, OUTPUT_CAP));
 
     let wait = child.wait();
     match timeout(limit, wait).await {
         Ok(Ok(status)) => {
-            let stdout = stdout_task.await.unwrap_or_default();
-            let stderr = stderr_task.await.unwrap_or_default();
+            // The shell may have exited while a background descendant remains.
+            // It is still part of this attempt, so terminate it before draining.
+            process_group.kill();
+            let (stdout, mut stderr, drain_timed_out) =
+                drain_pipes(&mut stdout_task, &mut stderr_task).await;
+            if drain_timed_out {
+                stderr.push_str("\ncrosshair: output drain timed out");
+            }
             AttemptOutcome {
                 started_at,
                 finished_at: Utc::now(),
-                exit_code: status.code(),
+                exit_code: if drain_timed_out { None } else { status.code() },
                 stdout,
                 stderr,
-                timed_out: false,
+                timed_out: drain_timed_out,
             }
         }
         Ok(Err(e)) => {
-            let _ = child.kill().await;
-            let stdout = stdout_task.await.unwrap_or_default();
-            let stderr = stderr_task.await.unwrap_or_default();
+            process_group.kill();
+            let _ = timeout(PIPE_DRAIN_TIMEOUT, child.wait()).await;
+            let (stdout, mut stderr, drain_timed_out) =
+                drain_pipes(&mut stdout_task, &mut stderr_task).await;
+            if drain_timed_out {
+                stderr.push_str("\ncrosshair: output drain timed out");
+            }
             AttemptOutcome {
                 started_at,
                 finished_at: Utc::now(),
                 exit_code: None,
                 stdout,
                 stderr: format!("{stderr}\nwait failed: {e}"),
-                timed_out: false,
+                timed_out: drain_timed_out,
             }
         }
         Err(_) => {
-            // Timeout — kill the child, drain pipes, surface as failure.
-            let _ = child.kill().await;
-            let stdout = stdout_task.await.unwrap_or_default();
-            let stderr = stderr_task.await.unwrap_or_default();
+            // Timeout — kill the process group, then drain only within a bound.
+            process_group.kill();
+            let _ = timeout(PIPE_DRAIN_TIMEOUT, child.wait()).await;
+            let (stdout, mut stderr, drain_timed_out) =
+                drain_pipes(&mut stdout_task, &mut stderr_task).await;
+            if drain_timed_out {
+                stderr.push_str("\ncrosshair: output drain timed out");
+            }
             AttemptOutcome {
                 started_at,
                 finished_at: Utc::now(),
@@ -135,6 +208,71 @@ pub async fn run_attempt(t: &StrategyTarget) -> AttemptOutcome {
                 ),
                 timed_out: true,
             }
+        }
+    }
+}
+
+/// A process group is the lifetime boundary for an attempt. Dropping the
+/// future (including task cancellation) therefore cannot leave descendants
+/// behind merely because Tokio's `kill_on_drop` only knows the direct child.
+struct AttemptProcessGroup {
+    #[cfg(unix)]
+    pgid: u32,
+}
+
+impl AttemptProcessGroup {
+    fn new(pgid: u32) -> Self {
+        #[cfg(unix)]
+        {
+            Self { pgid }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pgid;
+            Self {}
+        }
+    }
+
+    fn kill(&self) {
+        #[cfg(unix)]
+        {
+            // Negative PID targets the Unix process group. ESRCH is expected when
+            // every member has already exited, and is harmless.
+            let result = unsafe { libc::kill(-(self.pgid as libc::pid_t), libc::SIGKILL) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    tracing::warn!(pgid = self.pgid, error = %error, "failed to kill strategy process group");
+                }
+            }
+        }
+    }
+}
+
+impl Drop for AttemptProcessGroup {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+async fn drain_pipes(
+    stdout_task: &mut JoinHandle<String>,
+    stderr_task: &mut JoinHandle<String>,
+) -> (String, String, bool) {
+    match timeout(PIPE_DRAIN_TIMEOUT, async {
+        let stdout = (&mut *stdout_task).await.unwrap_or_default();
+        let stderr = (&mut *stderr_task).await.unwrap_or_default();
+        (stdout, stderr)
+    })
+    .await
+    {
+        Ok((stdout, stderr)) => (stdout, stderr, false),
+        Err(_) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            (String::new(), String::new(), true)
         }
     }
 }
@@ -160,7 +298,14 @@ mod tests {
     use super::*;
     use crate::loader::StrategyTarget;
     use crate::schema::{Status, Strategy, Target};
+    use chrono::TimeZone;
+    #[cfg(unix)]
+    use std::fs;
     use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::time::Instant;
+    #[cfg(unix)]
+    use tempfile::tempdir;
 
     fn make_target(command: &str, timeout: Option<&str>) -> StrategyTarget {
         let strategy = Strategy {
@@ -208,16 +353,106 @@ mod tests {
         assert!(o.stderr.contains("killed after"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_pipe_holding_grandchild_within_bound() {
+        let dir = tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let command = format!(
+            "sleep 30 & child=$!; echo $child > {}; wait",
+            pid_file.display()
+        );
+        let t = make_target(&command, Some("250ms"));
+
+        let started = Instant::now();
+        let o = run_attempt(&t).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(o.timed_out);
+
+        let pid = fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        wait_for_process_exit(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backgrounded_command_does_not_wedge_pipe_drain() {
+        let dir = tempdir().unwrap();
+        let pid_file = dir.path().join("background.pid");
+        let command = format!("sleep 30 & echo $! > {}", pid_file.display());
+        let t = make_target(&command, Some("250ms"));
+
+        let started = Instant::now();
+        let o = run_attempt(&t).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(o.succeeded());
+
+        let pid = fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        wait_for_process_exit(pid).await;
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_process_exit(pid: libc::pid_t) {
+        timeout(Duration::from_secs(1), async {
+            while process_exists(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("strategy descendant {pid} survived cleanup"));
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: libc::pid_t) -> bool {
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
     #[test]
     fn terminal_status_skips_attempt() {
         let mut t = make_target("true", None);
+        let state = TargetState::empty("/tmp/test.yaml".into(), "T1".into());
         t.target.status = Status::Achieved;
-        assert!(!needs_attempt(&t));
+        assert!(!needs_attempt(&t, &state, Utc::now()).unwrap());
         t.target.status = Status::SetAside;
-        assert!(!needs_attempt(&t));
+        assert!(!needs_attempt(&t, &state, Utc::now()).unwrap());
         t.target.status = Status::Identified;
-        assert!(needs_attempt(&t));
+        assert!(!needs_attempt(&t, &state, Utc::now()).unwrap());
         t.target.status = Status::Converging;
-        assert!(needs_attempt(&t));
+        assert!(!needs_attempt(&t, &state, Utc::now()).unwrap());
+    }
+
+    #[test]
+    fn daily_cron_runs_once_per_day_across_ticks() {
+        let mut t = make_target("true", None);
+        t.strategy.trigger = "cron:0 0 * * *".into();
+        let first_tick = Utc.with_ymd_and_hms(2026, 7, 10, 0, 0, 15).unwrap();
+        let mut state = TargetState::empty("/tmp/test.yaml".into(), "T1".into());
+
+        assert!(needs_attempt(&t, &state, first_tick).unwrap());
+        state.last_attempt_at = Some(first_tick);
+        assert!(!needs_attempt(&t, &state, first_tick + chrono::Duration::seconds(30)).unwrap());
+        assert!(!needs_attempt(&t, &state, first_tick + chrono::Duration::hours(12)).unwrap());
+        assert!(needs_attempt(&t, &state, first_tick + chrono::Duration::days(1)).unwrap());
+    }
+
+    #[test]
+    fn interval_uses_last_attempt_as_its_rate_limit() {
+        let mut t = make_target("true", None);
+        t.strategy.trigger = "every:24h".into();
+        let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+        let mut state = TargetState::empty("/tmp/test.yaml".into(), "T1".into());
+
+        assert!(needs_attempt(&t, &state, now).unwrap());
+        state.last_attempt_at = Some(now);
+        assert!(!needs_attempt(&t, &state, now + chrono::Duration::hours(23)).unwrap());
+        assert!(needs_attempt(&t, &state, now + chrono::Duration::hours(24)).unwrap());
     }
 }

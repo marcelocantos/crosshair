@@ -15,7 +15,7 @@ Each tick is independent. Stranded work, missed runs, and transient failures all
 Crosshair and bullseye are two binaries, one system:
 
 - **Shared source of truth.** Crosshair reads `bullseye.yaml` directly. The `strategy` block on a target is the executor's per-target config — no duplicate config file.
-- **Shared "is this satisfied?" check.** Each tick, crosshair asks bullseye whether the target is achieved before running the strategy.
+- **Shared status source.** Each tick, crosshair reads bullseye's target status and skips terminal targets before evaluating a strategy.
 - **Shared status surface.** Per-target executor state (`last_attempt_at`, `consecutive_failures`, `cooldown_until`) is queryable alongside bullseye's existing target status.
 
 The repos are separate only because the runtime shapes differ: bullseye is a stateless CRUD-over-YAML MCP server, crosshair is a stateful daemon with a tick loop, SQLite, and launchd integration.
@@ -26,7 +26,10 @@ v0.1 — minimal end-to-end loop in place:
 
 - Loads bullseye.yaml files via `--config` and enumerates targets that carry a `strategy` block.
 - Runs each strategy command via `sh -c` with a per-attempt timeout (default 5m, overridable per-strategy).
+- Honors strategy scheduling: five-field `cron:` triggers run once per matching minute, `every:` triggers are rate-limited by the previous attempt, and `manual` triggers never run automatically.
+- Places each attempt in its own process group, so timeouts and backgrounded descendants cannot wedge later ticks or survive an attempt.
 - Persists `last_attempt_at`, `last_success_at`, `consecutive_failures`, `cooldown_until`, and the most recent stdout/stderr/exit to SQLite.
+- Uses SQLite WAL mode and a busy timeout; an in-memory fallback preserves the next-tick cooldown if a transient persist fails.
 - Backs off after consecutive failures on a 30m → 2h → 6h → 24h ladder before retrying.
 - `crosshair status -c <yaml>` prints one row per strategy-bearing target with its persisted state.
 
@@ -49,6 +52,17 @@ crosshair status -c /path/to/bullseye.yaml
 
 State defaults to `$HOME/.local/state/crosshair/state.db`; override with `--state`.
 
+### Trigger scheduling
+
+```yaml
+strategy:
+  command: /path/to/sync
+  trigger: "cron:0 2 * * *" # once at 02:00 UTC each day
+  timeout: 2m
+```
+
+Crosshair supports `cron:<five-field expression>`, `every:<duration>`, and `manual`. Cron expressions run once in each matching minute; intervals run at most once per duration from the prior attempt; manual strategies are never run by the tick loop.
+
 ## Install
 
 ```bash
@@ -56,6 +70,14 @@ brew install marcelocantos/tap/crosshair
 ```
 
 Or build from source with `cargo install --path .` from a checkout.
+
+## Quick start for coding agents
+
+Give your coding agent this prompt:
+
+```text
+Install crosshair from https://github.com/marcelocantos/crosshair with Homebrew, then run `crosshair --help-agent` and follow the bundled guide to configure a strategy in bullseye.yaml.
+```
 
 ## For coding agents
 
