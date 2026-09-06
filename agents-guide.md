@@ -27,8 +27,8 @@ targets:
       trigger: "cron:*/30 * * * *" # five-field cron expression
       timeout: 2m              # per-attempt ceiling; default 5m
       retry:
-        max_attempts: 5        # advisory in v0.1; cooldown ladder is fixed
-        backoff: exponential
+        max_attempts: 5        # parsed, but not yet read by the runner
+        backoff: exponential   # ditto; the cooldown ladder is fixed
 ```
 
 The `command` is dispatched through `sh -c`, so pipes, env interpolation, and absolute paths all work. The strategy is responsible for being idempotent — when the target's desired state is already in place, the command should exit 0 quickly (a heartbeat, not a full re-run).
@@ -51,7 +51,9 @@ crosshair status  -c <bullseye.yaml>
 - `--once` — run a single tick and exit. Useful for cron-driven setups and tests.
 - `--state` — SQLite path. Defaults to `$HOME/.local/state/crosshair/state.db`.
 
-`crosshair status` prints one row per strategy-bearing target, joining the YAML view with the persisted state so targets that have never run yet still appear (with `—` in the timestamp columns).
+`crosshair status` prints one row per strategy-bearing target, joining the YAML view with the persisted state so targets that have never run yet still appear (with `—` in the timestamp columns). Columns are `TARGET STATUS OUTCOME "LAST ATTEMPT" "LAST SUCCESS" FAILS COOLDOWN`; `OUTCOME` is `ok`, `fail`, `timeout`, or `—` for a target that has never run. Timestamps are UTC.
+
+`--help-agent` is exclusive: it cannot be combined with a subcommand. Running `crosshair` with no subcommand prints the ordinary help.
 
 ## Tick loop
 
@@ -102,11 +104,12 @@ Drop this at `~/Library/LaunchAgents/com.<you>.crosshair.plist`, then `launchctl
 
 The SQLite store keys on the *canonical absolute path* of the YAML file plus the target ID. Moving a YAML file invalidates the prior state — crosshair will start fresh against the new path. For stable identity across renames, keep a single canonical YAML file per host or use symlinks pointing at one canonical location.
 
-## Limits in v0.1
+## Current limits
 
 - **Satisfaction check is trust-the-status-field.** `achieved` / `set_aside` skip; due non-terminal strategies run their command and let it decide. A pluggable check is planned.
-- **Triggers are deliberately narrow.** Only five-field `cron:`, duration-based `every:`, and `manual` are supported. Unsupported trigger kinds fail the tick rather than silently running at the wrong cadence.
-- **Backoff ladder is hard-coded.** `retry.backoff` is parsed but the schedule is fixed at 30m → 2h → 6h → 24h.
+- **Triggers are deliberately narrow.** Only five-field `cron:`, duration-based `every:`, and `manual` are supported. An unsupported or malformed trigger errors that one target — the tick logs a warning and moves on to the next target — rather than silently running at the wrong cadence.
+- **Backoff ladder is hard-coded.** `retry.max_attempts` and `retry.backoff` are deserialised and then never read; the schedule is fixed at 30m → 2h → 6h → 24h.
+- **Captured output is stored but not surfaced.** Each attempt's stdout/stderr goes into SQLite, but no subcommand prints it — `crosshair status` shows only the exit outcome. Read it with `sqlite3 ~/.local/state/crosshair/state.db 'select last_stdout, last_stderr from target_state'` until a subcommand exists.
 - **No notifications, no agent escalation, no MCP surface.** Failures show up in `crosshair status` and the launchd log; everything past that is for later releases.
 
 ## Gotchas
@@ -115,4 +118,6 @@ The SQLite store keys on the *canonical absolute path* of the YAML file plus the
 - Absolute paths beat `$PATH` — launchd's default `PATH` is minimal. Either set `EnvironmentVariables.PATH` in the plist, or use absolute paths in the strategy command.
 - The state DB and the launchd log are *not* in the same directory. State: `~/.local/state/crosshair/state.db`. Logs: wherever your plist points `StandardOutPath` (the recommended setup uses `~/.local/var/log/crosshair.log`).
 - `crosshair status` reads the same `--config` files as `run`. If a target was deleted from the YAML, it disappears from `status` even if there's still a state row in SQLite.
+- Output is capped twice: at most 64 KiB of stdout and 64 KiB of stderr are read from the pipes, and only the first 4096 bytes of each are persisted. A chatty strategy loses its tail — log to a file if you need the whole thing.
+- Cron triggers are evaluated against UTC, not local time. A `cron:0 2 * * *` strategy fires at 02:00 UTC.
 - An attempt owns its own Unix process group. Crosshair kills that group after a timeout and when the shell exits, so commands must not background or daemonize work they expect to survive the attempt.

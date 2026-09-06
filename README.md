@@ -22,9 +22,9 @@ The repos are separate only because the runtime shapes differ: bullseye is a sta
 
 ## Status
 
-v0.1 — minimal end-to-end loop in place:
+v0.2.0 — the end-to-end loop is in place and hardened:
 
-- Loads bullseye.yaml files via `--config` and enumerates targets that carry a `strategy` block.
+- Loads bullseye.yaml files via `--config` (repeatable) and enumerates targets that carry a `strategy` block. Unknown YAML fields are ignored, so newer bullseye files still load.
 - Runs each strategy command via `sh -c` with a per-attempt timeout (default 5m, overridable per-strategy).
 - Honors strategy scheduling: five-field `cron:` triggers run once per matching minute, `every:` triggers are rate-limited by the previous attempt, and `manual` triggers never run automatically.
 - Places each attempt in its own process group, so timeouts and backgrounded descendants cannot wedge later ticks or survive an attempt.
@@ -35,7 +35,7 @@ v0.1 — minimal end-to-end loop in place:
 
 Designed to run as a launchd KeepAlive job. The first proof-point convergence target is yadm dotfile sync, previously driven by `com.marcelocantos.yadm-auto-sync` directly.
 
-See `bullseye.yaml` for the convergence targets driving this repo.
+See `CHANGELOG.md` for what landed in each release, `bullseye.yaml` for the convergence targets driving this repo, and `docs/` for audit reports.
 
 ## Usage
 
@@ -50,6 +50,8 @@ crosshair run -c /path/to/bullseye.yaml --tick 30m
 crosshair status -c /path/to/bullseye.yaml
 ```
 
+`--tick` defaults to `30s`. It sets how often crosshair re-evaluates triggers, not how often a strategy runs — the trigger decides that.
+
 State defaults to `$HOME/.local/state/crosshair/state.db`; override with `--state`.
 
 ### Trigger scheduling
@@ -61,7 +63,7 @@ strategy:
   timeout: 2m
 ```
 
-Crosshair supports `cron:<five-field expression>`, `every:<duration>`, and `manual`. Cron expressions run once in each matching minute; intervals run at most once per duration from the prior attempt; manual strategies are never run by the tick loop.
+Crosshair supports `cron:<five-field expression>`, `every:<duration>`, and `manual`. Cron expressions run once in each matching minute; intervals run at most once per duration from the prior attempt; manual strategies are never run by the tick loop. Cron expressions are evaluated in UTC.
 
 ## Install
 
@@ -69,7 +71,9 @@ Crosshair supports `cron:<five-field expression>`, `every:<duration>`, and `manu
 brew install marcelocantos/tap/crosshair
 ```
 
-Or build from source with `cargo install --path .` from a checkout.
+Or build from source with `cargo install --path .` from a checkout. Release binaries are published for macOS arm64, Linux amd64, and Linux arm64.
+
+Crosshair targets Unix: it dispatches strategies through `sh -c` and manages each attempt as a Unix process group.
 
 ## Quick start for coding agents
 
@@ -81,7 +85,7 @@ Install crosshair from https://github.com/marcelocantos/crosshair with Homebrew,
 
 ## For coding agents
 
-If you use an agentic coding tool, include `agents-guide.md` in the project context, or run `crosshair --help-agent` to print the CLI reference and the agent guide together.
+If you use an agentic coding tool, include `agents-guide.md` in the project context, or run `crosshair --help-agent` to print the CLI reference and the agent guide together. Contributors should start from [`AGENTS.md`](AGENTS.md).
 
 ## Licence
 
