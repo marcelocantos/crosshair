@@ -21,4 +21,8 @@ Rust edition 2024.
 
 ## Delivery
 
-Merged to master.
+Merged to master, through a gated push. `scripts/hooks/pre-push` runs
+`make gate` (fmt check, clippy `-D warnings`, tests) and refuses the push
+when it is red; CI runs the same recipe on master, on `v*` tags and on
+pull requests. Wire the hook once per clone with `make hooks`. The owner's
+emergency bypass is `git push --no-verify`; agents must not use it.
