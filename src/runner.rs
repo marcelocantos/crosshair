@@ -12,6 +12,7 @@
 
 use std::process::Stdio;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -51,6 +52,22 @@ impl AttemptOutcome {
     }
 }
 
+/// Counts cron expressions compiled since the process started.
+///
+/// Compiling a cron expression is the only non-trivial work trigger
+/// evaluation does, and the tick evaluates every strategy-bearing target
+/// in the fleet on every interval. The counter exists so a benchmark can
+/// assert how many compiles one pass costs, and so a change that starts
+/// compiling per-target again fails the gate instead of quietly costing
+/// the daemon a compile per target per minute. Take a delta around the
+/// call under test; the absolute value means nothing.
+static CRON_PARSES: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the process-wide number of cron expressions compiled so far.
+pub fn cron_parse_count() -> u64 {
+    CRON_PARSES.load(Ordering::Relaxed)
+}
+
 /// Decide whether a strategy is due for an automatic attempt.
 ///
 /// Terminal targets and manual strategies never run. Cron strategies run once
@@ -71,6 +88,7 @@ pub fn needs_attempt(t: &StrategyTarget, state: &TargetState, now: DateTime<Utc>
         if expression.split_whitespace().count() != 5 {
             bail!("cron trigger must contain five fields: {expression:?}");
         }
+        CRON_PARSES.fetch_add(1, Ordering::Relaxed);
         let schedule = Cron::from_str(expression)
             .with_context(|| format!("parse cron trigger {expression:?}"))?;
         let current_minute = now

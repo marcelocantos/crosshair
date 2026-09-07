@@ -27,3 +27,10 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3.14.0"
+
+# The benchmark harness is benches/bench.rs itself — no framework, so no
+# criterion (and no plotters or rayon) in the dev graph of a 1,700-line
+# crate. `cargo bench -- --gate` is the perf gate; see docs/perf/baseline.md.
+[[bench]]
+name = "bench"
+harness = false

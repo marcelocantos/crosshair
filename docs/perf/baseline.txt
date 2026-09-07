@@ -1,0 +1,3 @@
+# crosshair benchmarks — see docs/perf/baseline.md
+ReloadFleet	10503167 ns/op	24 files	360 strategy-targets	702348 yaml-bytes
+EvaluateTriggers	3282250 ns/op	360 cron-parses	360 targets
