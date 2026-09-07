@@ -1,7 +1,8 @@
 bullseye:
 	@cargo fmt --check && echo "✓ fmt"
 	@cargo clippy --quiet --all-targets -- -D warnings && echo "✓ clippy"
-	@cargo test --quiet 2>&1 | tail -5 && echo "✓ tests"
+	@out=$$(cargo test --quiet 2>&1); rc=$$?; printf '%s\n' "$$out" | tail -5; \
+	if [ $$rc -ne 0 ]; then echo "✗ tests"; exit $$rc; fi; echo "✓ tests"
 	@test -z "$$(git status --porcelain)" && echo "✓ clean" || \
 	 (echo "✗ dirty tree"; git status --short; exit 1)
 
