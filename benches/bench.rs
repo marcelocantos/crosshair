@@ -177,7 +177,8 @@ fn run_all(corpus: &Corpus) -> Vec<Sample> {
         })
         .with("files", corpus.paths.len() as f64)
         .with("strategy-targets", targets.len() as f64)
-        .with("yaml-bytes", corpus.bytes as f64),
+        .with("yaml-bytes", corpus.bytes as f64)
+        .with("doc-parses", doc_parses_per_reload(&corpus.paths)),
         // Trigger evaluation for every strategy-bearing target, which
         // the tick does immediately after the reload.
         bench("EvaluateTriggers", |_| {
@@ -194,10 +195,20 @@ fn run_all(corpus: &Corpus) -> Vec<Sample> {
     ]
 }
 
-/// How many cron expressions one pass over the fleet compiles. It is a
-/// function of the corpus and the code, so it is compared exactly: the
-/// point of caching compiled schedules is that this number stops
-/// tracking the target count.
+/// How many bullseye.yaml documents one reload of an unchanged fleet
+/// parses. Zero is the steady state the cache exists to produce, and
+/// locking it is what makes a change that defeats the cache fail the
+/// gate rather than merely make the daemon slower.
+fn doc_parses_per_reload(paths: &[PathBuf]) -> f64 {
+    let before = crosshair::loader::doc_parse_count();
+    let _ = load_strategy_targets(paths).expect("reload");
+    (crosshair::loader::doc_parse_count() - before) as f64
+}
+
+/// How many cron expressions one pass over the fleet compiles once the
+/// schedules are warm. It is a function of the corpus and the code, so
+/// it is compared exactly: the point of caching compiled schedules is
+/// that this number stops tracking the target count.
 fn cron_parses_per_eval(
     targets: &[StrategyTarget],
     state: &TargetState,

@@ -10,9 +10,11 @@
 // is the canonical example: it logs a heartbeat when there are no
 // changes to commit).
 
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -68,6 +70,35 @@ pub fn cron_parse_count() -> u64 {
     CRON_PARSES.load(Ordering::Relaxed)
 }
 
+/// Compiled schedules, keyed by the expression they were compiled from.
+///
+/// A cron expression is a pure function of its text, so a compiled
+/// schedule can be reused for the life of the process; the tick was
+/// compiling one per strategy-bearing target per interval, which on a
+/// fleet of a few hundred targets at the default 30-second tick is
+/// around a million compiles a day for a fixed handful of distinct
+/// expressions. The cache is keyed by the trimmed expression rather
+/// than by target, so the fleet's many `*/5 * * * *` targets share one.
+static CRON_CACHE: LazyLock<Mutex<HashMap<String, Arc<Cron>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Compile `expression`, or return the schedule already compiled from
+/// identical text.
+fn cron_schedule(expression: &str) -> Result<Arc<Cron>> {
+    if let Some(schedule) = CRON_CACHE.lock().expect("cron cache").get(expression) {
+        return Ok(Arc::clone(schedule));
+    }
+    CRON_PARSES.fetch_add(1, Ordering::Relaxed);
+    let schedule = Arc::new(
+        Cron::from_str(expression).with_context(|| format!("parse cron trigger {expression:?}"))?,
+    );
+    CRON_CACHE
+        .lock()
+        .expect("cron cache")
+        .insert(expression.to_string(), Arc::clone(&schedule));
+    Ok(schedule)
+}
+
 /// Decide whether a strategy is due for an automatic attempt.
 ///
 /// Terminal targets and manual strategies never run. Cron strategies run once
@@ -88,9 +119,7 @@ pub fn needs_attempt(t: &StrategyTarget, state: &TargetState, now: DateTime<Utc>
         if expression.split_whitespace().count() != 5 {
             bail!("cron trigger must contain five fields: {expression:?}");
         }
-        CRON_PARSES.fetch_add(1, Ordering::Relaxed);
-        let schedule = Cron::from_str(expression)
-            .with_context(|| format!("parse cron trigger {expression:?}"))?;
+        let schedule = cron_schedule(expression)?;
         let current_minute = now
             .with_second(0)
             .and_then(|time| time.with_nanosecond(0))
@@ -118,6 +147,37 @@ pub fn needs_attempt(t: &StrategyTarget, state: &TargetState, now: DateTime<Utc>
     }
 
     bail!("unsupported strategy trigger {trigger:?}")
+}
+
+#[cfg(test)]
+mod cron_cache_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// Identical expressions share one compiled schedule; different ones
+    /// do not. Asserted by pointer identity rather than by the compile
+    /// counter, which is process-wide while cargo runs tests in
+    /// parallel.
+    #[test]
+    fn identical_expressions_share_a_compiled_schedule() {
+        let a = cron_schedule("*/7 * * * *").unwrap();
+        let b = cron_schedule("*/7 * * * *").unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "second compile of the same text");
+
+        let other = cron_schedule("*/11 * * * *").unwrap();
+        assert!(!Arc::ptr_eq(&a, &other), "different text shared a schedule");
+    }
+
+    /// A cached schedule still answers about the time it is asked
+    /// about, not the time it was compiled at.
+    #[test]
+    fn a_cached_schedule_still_matches_by_time() {
+        let schedule = cron_schedule("*/5 * * * *").unwrap();
+        let on = Utc.with_ymd_and_hms(2026, 9, 7, 10, 5, 0).unwrap();
+        let off = Utc.with_ymd_and_hms(2026, 9, 7, 10, 6, 0).unwrap();
+        assert!(schedule.is_time_matching(&on).unwrap());
+        assert!(!schedule.is_time_matching(&off).unwrap());
+    }
 }
 
 /// Resolve the strategy's per-attempt timeout, falling back to default.
