@@ -54,8 +54,10 @@ impl AttemptOutcome {
 /// Decide whether a strategy is due for an automatic attempt.
 ///
 /// Terminal targets and manual strategies never run. Cron strategies run once
-/// in each matching minute; interval strategies run no more often than their
-/// configured duration, measured from the previous attempt.
+/// per fire instant, catching up when the tick cadence steps over one (a
+/// strategy that has never run waits for a matching minute rather than firing
+/// on boot); interval strategies run no more often than their configured
+/// duration, measured from the previous attempt.
 pub fn needs_attempt(t: &StrategyTarget, state: &TargetState, now: DateTime<Utc>) -> Result<bool> {
     if t.target.status.is_terminal() {
         return Ok(false);
@@ -77,16 +79,25 @@ pub fn needs_attempt(t: &StrategyTarget, state: &TargetState, now: DateTime<Utc>
             .with_second(0)
             .and_then(|time| time.with_nanosecond(0))
             .expect("zero is a valid second and nanosecond");
-        if !schedule
-            .is_time_matching(&current_minute)
-            .with_context(|| format!("evaluate cron trigger {expression:?}"))?
-        {
-            return Ok(false);
-        }
 
-        return Ok(state
-            .last_attempt_at
-            .is_none_or(|previous| previous < current_minute));
+        let Some(previous_attempt) = state.last_attempt_at else {
+            // Nothing has run yet, so there is no window to catch up on. Fire
+            // only inside a matching minute rather than immediately on boot,
+            // which would turn every daemon restart into an extra run.
+            return schedule
+                .is_time_matching(&current_minute)
+                .with_context(|| format!("evaluate cron trigger {expression:?}"));
+        };
+
+        // The tick cadence is coarser than the cron grid (the shipped launchd
+        // command uses `--tick 30m`), so testing the current minute for a match
+        // would skip every fire instant the sampler happens to step over. Ask
+        // instead whether the most recent fire instant at or before now is one
+        // we still owe.
+        let last_fire = schedule
+            .find_previous_occurrence(&current_minute, true)
+            .with_context(|| format!("evaluate cron trigger {expression:?}"))?;
+        return Ok(previous_attempt < last_fire);
     }
 
     if let Some(duration) = trigger.strip_prefix("every:") {
@@ -441,6 +452,56 @@ mod tests {
         assert!(!needs_attempt(&t, &state, first_tick + chrono::Duration::seconds(30)).unwrap());
         assert!(!needs_attempt(&t, &state, first_tick + chrono::Duration::hours(12)).unwrap());
         assert!(needs_attempt(&t, &state, first_tick + chrono::Duration::days(1)).unwrap());
+    }
+
+    #[test]
+    fn cron_catches_up_after_a_missed_minute() {
+        let mut t = make_target("true", None);
+        t.strategy.trigger = "cron:0 2 * * *".into();
+        let mut state = TargetState::empty("/tmp/test.yaml".into(), "T1".into());
+        state.last_attempt_at = Some(Utc.with_ymd_and_hms(2026, 7, 10, 2, 0, 0).unwrap());
+
+        // The tick lands at 02:30, half an hour after the 02:00 fire instant.
+        // The day's run is still owed.
+        let now = Utc.with_ymd_and_hms(2026, 7, 11, 2, 30, 0).unwrap();
+        assert!(needs_attempt(&t, &state, now).unwrap());
+    }
+
+    #[test]
+    fn cron_fires_once_when_ticked_at_thirty_minute_steps() {
+        let mut t = make_target("true", None);
+        t.strategy.trigger = "cron:0 2 * * *".into();
+        let mut state = TargetState::empty("/tmp/test.yaml".into(), "T1".into());
+
+        // `--tick 30m` is the documented launchd cadence (README, agents-guide),
+        // and its phase is process start, so ticks never land on :00.
+        let start = Utc.with_ymd_and_hms(2026, 7, 10, 8, 17, 0).unwrap();
+        state.last_attempt_at = Some(start);
+
+        let step = chrono::Duration::minutes(30);
+        let steps_in_a_day = chrono::Duration::days(1).num_minutes() / step.num_minutes();
+        let mut fires = 0;
+        for i in 1..=steps_in_a_day {
+            let now = start + step * i as i32;
+            if needs_attempt(&t, &state, now).unwrap() {
+                fires += 1;
+                state.last_attempt_at = Some(now);
+            }
+        }
+        assert_eq!(fires, 1, "a daily cron must fire exactly once per day");
+    }
+
+    #[test]
+    fn cron_does_not_refire_within_the_same_period() {
+        let mut t = make_target("true", None);
+        t.strategy.trigger = "cron:0 2 * * *".into();
+        let mut state = TargetState::empty("/tmp/test.yaml".into(), "T1".into());
+        let fired = Utc.with_ymd_and_hms(2026, 7, 11, 2, 30, 0).unwrap();
+        state.last_attempt_at = Some(fired);
+
+        assert!(!needs_attempt(&t, &state, fired + chrono::Duration::hours(1)).unwrap());
+        assert!(!needs_attempt(&t, &state, fired + chrono::Duration::hours(23)).unwrap());
+        assert!(needs_attempt(&t, &state, fired + chrono::Duration::hours(24)).unwrap());
     }
 
     #[test]

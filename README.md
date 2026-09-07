@@ -26,7 +26,7 @@ v0.1 — minimal end-to-end loop in place:
 
 - Loads bullseye.yaml files via `--config` and enumerates targets that carry a `strategy` block.
 - Runs each strategy command via `sh -c` with a per-attempt timeout (default 5m, overridable per-strategy).
-- Honors strategy scheduling: five-field `cron:` triggers run once per matching minute, `every:` triggers are rate-limited by the previous attempt, and `manual` triggers never run automatically.
+- Honors strategy scheduling: five-field `cron:` triggers run once per fire instant, `every:` triggers are rate-limited by the previous attempt, and `manual` triggers never run automatically. A `cron:` trigger catches up: if the tick interval steps over a fire instant (`--tick 30m` against `cron:0 2 * * *`), or the daemon was down when one passed, the next tick still runs it once. A strategy that has never run waits for a matching minute rather than firing on the first tick after it is added.
 - Places each attempt in its own process group, so timeouts and backgrounded descendants cannot wedge later ticks or survive an attempt.
 - Persists `last_attempt_at`, `last_success_at`, `consecutive_failures`, `cooldown_until`, and the most recent stdout/stderr/exit to SQLite.
 - Uses SQLite WAL mode and a busy timeout; an in-memory fallback preserves the next-tick cooldown if a transient persist fails.
