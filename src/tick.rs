@@ -61,6 +61,10 @@ pub async fn run(args: RunArgs) -> Result<()> {
 }
 
 async fn run_one_tick(args: &RunArgs, store: &Store) {
+    run_one_tick_at(args, store, Utc::now).await;
+}
+
+async fn run_one_tick_at(args: &RunArgs, store: &Store, now: impl Fn() -> DateTime<Utc>) {
     let targets = match load_strategy_targets(&args.common.configs) {
         Ok(ts) => ts,
         Err(e) => {
@@ -74,9 +78,10 @@ async fn run_one_tick(args: &RunArgs, store: &Store) {
         return;
     }
 
-    let now = Utc::now();
+    // Sample `now` per target so a long earlier attempt cannot hide a
+    // later never-run cron whose minute arrives during that attempt.
     for t in targets {
-        if let Err(e) = converge_one(store, &t, now).await {
+        if let Err(e) = converge_one(store, &t, now()).await {
             warn!(target = %t.target_id, file = %t.yaml_path.display(), error = %e, "tick error");
         }
     }
@@ -229,6 +234,78 @@ targets:
                 .unwrap()
                 .last_success_at
                 .is_some()
+        );
+    }
+
+    /// Fable F1: a tick-start `now` plus a long earlier target hides a
+    /// never-run cron whose minute arrives while that first attempt runs.
+    /// Catch-up (K1) only helps after a prior `last_attempt_at`.
+    #[tokio::test]
+    async fn never_run_cron_still_fires_after_earlier_target_occupies_its_minute() {
+        use chrono::TimeZone;
+        use std::sync::atomic::AtomicUsize;
+
+        let tick_start = Utc.with_ymd_and_hms(2026, 7, 11, 2, 0, 0).unwrap();
+        let after_t1 = Utc.with_ymd_and_hms(2026, 7, 11, 2, 5, 0).unwrap();
+        let calls = AtomicUsize::new(0);
+        let now = || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                tick_start
+            } else {
+                after_t1
+            }
+        };
+
+        let mut config = NamedTempFile::new().unwrap();
+        config
+            .write_all(
+                br#"
+schema_version: 3
+targets:
+  T1:
+    name: occupies the cron minute
+    status: identified
+    strategy:
+      command: "true"
+      trigger: "every:1s"
+      timeout: 90s
+  T2:
+    name: never-run cron hidden by tick-start now
+    status: identified
+    strategy:
+      command: "echo cron-ran"
+      trigger: "cron:5 2 * * *"
+      timeout: 1s
+"#,
+            )
+            .unwrap();
+        let state_dir = tempdir().unwrap();
+        let args = RunArgs {
+            common: CommonArgs {
+                configs: vec![config.path().to_path_buf()],
+                state: Some(state_dir.path().join("state.db")),
+            },
+            tick: "30s".to_string(),
+            once: true,
+        };
+        let store = Store::open(args.common.state.as_ref().unwrap()).unwrap();
+
+        time::timeout(Duration::from_secs(2), run_one_tick_at(&args, &store, now))
+            .await
+            .expect("tick exceeded bound");
+
+        let targets = load_strategy_targets(&args.common.configs).unwrap();
+        let cron_target = targets
+            .iter()
+            .find(|target| target.target_id == "T2")
+            .unwrap();
+        assert!(
+            store
+                .get_or_empty(cron_target)
+                .unwrap()
+                .last_attempt_at
+                .is_some(),
+            "never-run cron whose minute was occupied by T1 must still fire this tick"
         );
     }
 
