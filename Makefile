@@ -6,3 +6,10 @@ bullseye:
 	 (echo "✗ dirty tree"; git status --short; exit 1)
 
 .PHONY: bullseye
+
+# Publish the formula to the Homebrew tap for an existing release. Run after
+# the release assets exist — tapper reads them to build the formula.
+release-tap:
+	./scripts/release-tap.sh $(TAG)
+
+.PHONY: release-tap
