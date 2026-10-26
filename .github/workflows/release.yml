@@ -54,24 +54,3 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "$GITHUB_REF_NAME" "$asset" "$asset.sha256" --clobber
-
-  homebrew:
-    name: Update Homebrew tap
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: Justintime50/homebrew-releaser@v3
-        with:
-          homebrew_owner: marcelocantos
-          homebrew_tap: homebrew-tap
-          github_token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          formula_folder: Formula
-          version: ${{ github.event.release.tag_name }}
-          install: 'bin.install "crosshair" => "crosshair"'
-          target_darwin_arm64: true
-          target_linux_amd64: true
-          target_linux_arm64: true
-          test: 'system bin/"crosshair", "--version"'
-          skip_checksum: true
-          update_readme_table: true
